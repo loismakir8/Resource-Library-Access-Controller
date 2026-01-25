@@ -9,8 +9,11 @@
 (define-constant ERR-MEMBERSHIP-EXPIRED (err u107))
 (define-constant ERR-RESOURCE-CHECKED-OUT (err u108))
 (define-constant ERR-OVERDUE (err u109))
+(define-constant ERR-ALREADY-RESERVED (err u110))
+(define-constant ERR-RESERVATION-NOT-FOUND (err u111))
 
 (define-data-var next-resource-id uint u1)
+(define-data-var next-reservation-id uint u1)
 (define-data-var next-member-id uint u1)
 (define-data-var late-fee-per-day uint u100)
 (define-data-var max-checkout-days uint u14)
@@ -66,6 +69,28 @@
 (define-map resource-queue
   { resource-id: uint, queue-position: uint }
   { member-id: uint, requested-at: uint }
+)
+
+(define-map reservations
+  { reservation-id: uint }
+  {
+    member-id: uint,
+    resource-id: uint,
+    reserved-at: uint,
+    queue-position: uint,
+    status: (string-ascii 20),
+    notified-at: (optional uint)
+  }
+)
+
+(define-map resource-queue-length
+  { resource-id: uint }
+  { length: uint }
+)
+
+(define-map member-resource-reservation
+  { member-id: uint, resource-id: uint }
+  { reservation-id: uint }
 )
 
 (define-data-var next-checkout-id uint u1)
@@ -311,4 +336,102 @@
     max-checkout-days: (var-get max-checkout-days),
     max-renewals: (var-get max-renewals)
   })
+)
+
+(define-private (get-queue-length (resource-id uint))
+  (default-to u0 (get length (map-get? resource-queue-length { resource-id: resource-id })))
+)
+
+(define-public (reserve-resource (resource-id uint))
+  (let (
+    (member-wallet-data (unwrap! (map-get? member-wallets { wallet: tx-sender }) ERR-NOT-AUTHORIZED))
+    (member-id (get member-id member-wallet-data))
+    (member-data (unwrap! (map-get? members { member-id: member-id }) ERR-NOT-FOUND))
+    (resource (unwrap! (map-get? resources { resource-id: resource-id }) ERR-NOT-FOUND))
+    (reservation-id (var-get next-reservation-id))
+    (current-queue-length (get-queue-length resource-id))
+    (new-position (+ current-queue-length u1))
+  )
+    (asserts! (get active member-data) ERR-ACCESS-DENIED)
+    (asserts! (> (get expiry-date member-data) stacks-block-height) ERR-MEMBERSHIP-EXPIRED)
+    (asserts! (is-none (map-get? member-resource-reservation { member-id: member-id, resource-id: resource-id })) ERR-ALREADY-RESERVED)
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      {
+        member-id: member-id,
+        resource-id: resource-id,
+        reserved-at: stacks-block-height,
+        queue-position: new-position,
+        status: "pending",
+        notified-at: none
+      }
+    )
+    
+    (map-set resource-queue-length
+      { resource-id: resource-id }
+      { length: new-position }
+    )
+    
+    (map-set member-resource-reservation
+      { member-id: member-id, resource-id: resource-id }
+      { reservation-id: reservation-id }
+    )
+    
+    (var-set next-reservation-id (+ reservation-id u1))
+    (ok { reservation-id: reservation-id, queue-position: new-position })
+  )
+)
+
+(define-public (cancel-reservation (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? reservations { reservation-id: reservation-id }) ERR-RESERVATION-NOT-FOUND))
+    (member-data (unwrap! (map-get? members { member-id: (get member-id reservation) }) ERR-NOT-FOUND))
+  )
+    (asserts! (or (is-eq tx-sender (get wallet member-data)) (is-eq tx-sender CONTRACT-OWNER)) ERR-NOT-AUTHORIZED)
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      (merge reservation { status: "cancelled" })
+    )
+    
+    (map-delete member-resource-reservation { member-id: (get member-id reservation), resource-id: (get resource-id reservation) })
+    
+    (ok true)
+  )
+)
+
+(define-public (fulfill-reservation (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? reservations { reservation-id: reservation-id }) ERR-RESERVATION-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      (merge reservation { 
+        status: "fulfilled",
+        notified-at: (some stacks-block-height)
+      })
+    )
+    
+    (map-delete member-resource-reservation { member-id: (get member-id reservation), resource-id: (get resource-id reservation) })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-reservation (reservation-id uint))
+  (map-get? reservations { reservation-id: reservation-id })
+)
+
+(define-read-only (get-member-reservation (member-id uint) (resource-id uint))
+  (match (map-get? member-resource-reservation { member-id: member-id, resource-id: resource-id })
+    reservation-ref (map-get? reservations { reservation-id: (get reservation-id reservation-ref) })
+    none
+  )
+)
+
+(define-read-only (get-resource-queue-length (resource-id uint))
+  (ok (get-queue-length resource-id))
 )
